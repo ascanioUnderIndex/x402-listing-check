@@ -1,0 +1,39 @@
+{
+  "name": "x402-listing-check",
+  "version": "0.1.0",
+  "description": "Check an x402 endpoint the way the Bazaar, agentic.market, x402scan and x402-list see it, before you list it",
+  "type": "module",
+  "bin": {
+    "x402-listing-check": "cli.mjs"
+  },
+  "main": "checks.mjs",
+  "files": [
+    "LICENSE",
+    "cli.mjs",
+    "checks.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "x402",
+    "bazaar",
+    "agentic-market",
+    "x402scan",
+    "payments",
+    "agents",
+    "lint"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ascanioUnderIndex/x402-listing-check.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@x402/extensions": "^2.28.0"
+  }
+}
