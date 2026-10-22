@@ -304,7 +304,8 @@ const looksLikeRoute = (s) => s.startsWith("/") || /^https?:\/\//.test(s) || MET
 /**
  * Entries of a /.well-known/x402 manifest, whatever the shape: plain URLs, "METHOD /path" strings,
  * objects carrying resource/url/path/endpoint (+ method, accepts, price...), maps keyed by route,
- * or a whole OpenAPI document. Deployed manifests use all of these.
+ * or a whole OpenAPI document. Deployed manifests use all of these. An object may add a routeTemplate
+ * (as in the Bazaar extension) so a probeable example URL also covers the whole family of routes.
  */
 export function manifestEntries(doc, origin) {
   const out = [];
@@ -314,7 +315,7 @@ export function manifestEntries(doc, origin) {
     if (typeof declared === "string") base = new URL(declared, origin).href;
   } catch {}
   const seen = new Set();
-  const add = (url, method, raw) => {
+  const add = (url, method, raw, template) => {
     if (typeof url !== "string") return;
     const m = url.match(METHOD_PREFIX);
     if (m) {
@@ -325,6 +326,7 @@ export function manifestEntries(doc, origin) {
     if (Array.isArray(method)) method = method.join("+");
     try {
       const entry = { url: new URL(url, base).href, method: typeof method === "string" ? method.toUpperCase() : undefined, raw };
+      if (typeof template === "string") entry.template = new URL(template, base).href;
       const key = `${entry.method} ${entry.url}`;
       if (!seen.has(key)) out.push(entry);
       seen.add(key);
@@ -333,7 +335,7 @@ export function manifestEntries(doc, origin) {
   const fromObject = (e, key) => {
     const r = e.resource;
     const url = (typeof r === "string" ? r : r?.url) ?? e.url ?? e.path ?? e.endpoint ?? key;
-    add(url, e.method ?? (r && typeof r === "object" ? r.method : undefined), e);
+    add(url, e.method ?? (r && typeof r === "object" ? r.method : undefined), e, e.routeTemplate ?? r?.routeTemplate);
   };
   for (const key of ROUTE_KEYS) {
     const list = doc?.[key];
@@ -434,7 +436,8 @@ export async function checkWellKnown(url, method, challenge) {
     out.push(warn(S, "no routes found in any shape the checker reads", "Clients cannot tell which routes are paid from this manifest."));
     return out;
   }
-  const matches = entries.filter((e) => routeMatches(e.url, url) && (!e.method || e.method.split(/[^A-Z]+/).includes(method)));
+  const listedAs = (e) => (routeMatches(e.url, url) ? e.url : e.template && routeMatches(e.template, url) ? e.template : null);
+  const matches = entries.filter((e) => listedAs(e) && (!e.method || e.method.split(/[^A-Z]+/).includes(method)));
   if (!matches.length) {
     const paged = doc.pagination || doc.next || doc.nextCursor;
     out.push(paged
@@ -442,7 +445,8 @@ export async function checkWellKnown(url, method, challenge) {
       : warn(S, `${method} ${new URL(url).pathname} is not listed`, "Crawlers that start from the manifest will not find this paid route."));
     return out;
   }
-  out.push(ok(S, `${method} ${new URL(url).pathname} is listed as ${matches[0].url.replace(origin, "")}`));
+  const shown = listedAs(matches[0]);
+  out.push(ok(S, `${method} ${new URL(url).pathname} is listed as ${decodeURIComponent(shown.replace(origin, ""))}${shown === matches[0].template ? " (routeTemplate)" : ""}`));
   if (challenge.error) return out;
 
   // Compare what the manifest declares with what the live 402 asks for; the 402 is what gets paid
