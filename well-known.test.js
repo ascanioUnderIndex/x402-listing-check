@@ -31,6 +31,39 @@ test("reads every entry shape deployed manifests use", () => {
   ]);
 });
 
+test("reads route maps, service lists, root accepts and inline OpenAPI", () => {
+  const show = (doc) => manifestEntries(doc, ORIGIN).map((e) => `${e.method ?? "*"} ${e.url}`);
+  assert.deepEqual(show({
+    baseUrl: "https://api.example.org/v2",
+    routes: { "POST /a": { accepts: [] }, search: { path: "/b" } },
+    endpoints: { "/c": { method: "get" } },
+    services: [{ id: "x", endpoint: "https://api.example.org/d", method: "POST" }],
+    tools: [{ slug: "y", endpoint: "/e" }],
+    accepts: [{ scheme: "exact", resource: "/f" }, { scheme: "exact" }],
+  }), [
+    "GET https://api.example.org/c", "POST https://api.example.org/a", "* https://api.example.org/b",
+    "POST https://api.example.org/d", "* https://api.example.org/e", "* https://api.example.org/f",
+  ]);
+  assert.deepEqual(show({ openapi: "3.1.0", servers: [{ url: "https://api.example.org/api" }], paths: { "/g/{id}": { post: {}, parameters: [] } } }),
+    ["POST https://api.example.org/api/g/%7Bid%7D"]);
+});
+
+test("accepts multi-method entries and does not blame paginated manifests", async () => {
+  serve(200, { base_url: ORIGIN, endpoints: [{ path: "/v1/thing/{id}", method: "GET+POST", price_usdc: 0.01 }, { path: "/v1/thing/{id}", method: "GET+POST" }] });
+  const out = msgs(await checkWellKnown(URL_, "GET", live));
+  assert.ok(out.includes("pass: found /.well-known/x402 (1 route)"));
+  assert.ok(out.includes("pass: price match the live 402"));
+  serve(200, { items: ["/other"], pagination: { next: "?page=2" } });
+  assert.ok(msgs(await checkWellKnown(URL_, "GET", live)).includes("info: GET /v1/thing/42 is not on the first page of the manifest"));
+});
+
+test("compares prices given as objects and in x-payment-info", async () => {
+  serve(200, { openapi: "3.1.0", paths: { "/v1/thing/{id}": { get: { "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.02" } } } } } });
+  assert.ok(msgs(await checkWellKnown(URL_, "GET", live)).includes("warn: manifest price $0.02 differs from the 402 ($0.01)"));
+  serve(200, { tools: [{ endpoint: "/v1/thing/:id", price: { amount: 0.01, currency: "USDC", type: "fixed" } }] });
+  assert.ok(msgs(await checkWellKnown(URL_, "GET", live)).includes("pass: price match the live 402"));
+});
+
 test("matches :param and {param} templates, not prefixes", () => {
   assert.ok(routeMatches(`${ORIGIN}/v1/thing/:id`, URL_));
   assert.ok(routeMatches(`${ORIGIN}/v1/thing/{id}`, URL_));
