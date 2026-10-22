@@ -20,20 +20,21 @@ node scan/scan.mjs 200
 | Tags dropped by the Bazaar sanitizer | 38 of 196 |
 | Extension rejected by the official validator | 7 of 196 |
 | Serve /.well-known/x402 | 130 of 200 |
-| Manifest lists the probed paid route | 116 of 130 |
-| Manifest repeats payment terms (payTo, network or price) | 42 of 130 |
-| Repeated terms disagree with the live 402 | 0 of 42 |
+| Manifest lists the probed paid route | 125 of 130 |
+| Manifest repeats payment terms (payTo, network or price) | 54 of 130 |
+| Repeated terms disagree with the live 402 | 0 of 54 |
 
 The same script run twice on 2026-10-22 gave identical counts.
 
 ## Reading it
 
 - **Presentation metadata is the common gap.** Two thirds of busy hosts have no icon and a quarter no name or tags, and one in five loses tags to the Bazaar sanitizer (more than 5, or longer than 32 characters) without any error.
-- **Manifests mostly point, they rarely restate.** 88 of the 130 manifests list routes without payment terms (plain URLs or `METHOD /path` strings). Where terms are restated, none disagreed with the live 402 on this sample, so drift between the two documents is not yet a measured problem, while routes missing from the manifest (14 of 130) are.
+- **Manifests mostly point, they rarely restate.** 76 of the 130 manifests give no payment terms for the probed route (plain URLs, `METHOD /path` strings, or objects without terms). Where terms are restated, none disagreed with the live 402 on this sample, so drift between the two documents is not yet a measured problem. Routes missing from the manifest are rarer than they first looked: 4 of 130, checked by hand, plus 1 paginated manifest where the route may be on a later page.
+- **The shapes are fragmented.** Routes sit under `resources`, `items`, `endpoints`, `routes`, `services`, `tools` or `accepts`, as lists or as maps keyed by route, with methods written as `GET`, `GET+POST` or arrays; one host serves a whole OpenAPI document at the well-known path. A first version of the checker read only four of these shapes and reported 14 missing routes: 9 were listed in shapes it did not read, 1 is on a paginated manifest.
 - **Matching is lenient on purpose.** A route counts as listed if the manifest has the same host and path, with `:param` / `{param}` segments matching any value and the method matching when the manifest gives one. Price is compared only for USDC and only when both sides state an exact amount.
 
 ## Limits
 
 - One route per host, so per-route problems on other routes are not counted.
 - The Bazaar ranks resources it has seen settle through its facilitator; hosts that settle elsewhere are underrepresented.
-- Manifests vary widely (`resources`, `items`, `endpoints`, `routes`, strings or objects). Entries in other shapes are not read, which can only undercount "listed".
+- Entries in shapes other than the ones above are not read, which can only undercount "listed". Paginated manifests are read up to the first page only.
