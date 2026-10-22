@@ -57,6 +57,15 @@ test("accepts multi-method entries and does not blame paginated manifests", asyn
   assert.ok(msgs(await checkWellKnown(URL_, "GET", live)).includes("info: GET /v1/thing/42 is not on the first page of the manifest"));
 });
 
+test("a probeable example URL with a routeTemplate covers the whole route family", async () => {
+  serve(200, { x402Version: 2, resources: [{ url: `${ORIGIN}/v1/thing/7`, routeTemplate: "/v1/thing/:id", method: "GET" }] });
+  const out = msgs(await checkWellKnown(URL_, "GET", live));
+  assert.ok(out.includes("pass: found /.well-known/x402 (1 route)"));
+  assert.ok(out.includes("pass: GET /v1/thing/42 is listed as /v1/thing/:id (routeTemplate)"));
+  serve(200, { x402Version: 2, resources: [{ url: `${ORIGIN}/v1/thing/7`, method: "GET" }] });
+  assert.ok(msgs(await checkWellKnown(URL_, "GET", live)).includes("warn: GET /v1/thing/42 is not listed"));
+});
+
 test("compares prices given as objects and in x-payment-info", async () => {
   serve(200, { openapi: "3.1.0", paths: { "/v1/thing/{id}": { get: { "x-payment-info": { price: { mode: "fixed", currency: "USD", amount: "0.02" } } } } } });
   assert.ok(msgs(await checkWellKnown(URL_, "GET", live)).includes("warn: manifest price $0.02 differs from the 402 ($0.01)"));
