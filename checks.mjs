@@ -296,7 +296,146 @@ export async function checkBazaarIndex(url, challenge) {
   }
 }
 
-export async function runChecks(url, { method = "GET", body, openapi = true, bazaar = true } = {}) {
+const METHOD_PREFIX = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)$/i;
+
+/**
+ * Entries of a /.well-known/x402 manifest, whatever the shape: plain URLs, "METHOD /path" strings,
+ * or objects carrying resource/url/path (+ method, accepts, price...). Deployed manifests mix all of these.
+ */
+export function manifestEntries(doc, origin) {
+  const out = [];
+  for (const key of ["resources", "items", "endpoints", "routes"]) {
+    if (!Array.isArray(doc?.[key])) continue;
+    for (const e of doc[key]) {
+      let url, method;
+      if (typeof e === "string") {
+        url = e;
+      } else if (e && typeof e === "object") {
+        const r = e.resource;
+        url = (typeof r === "string" ? r : r?.url) ?? e.url ?? e.path ?? e.endpoint;
+        method = e.method ?? (r && typeof r === "object" ? r.method : undefined);
+      }
+      if (typeof url !== "string") continue;
+      const m = url.match(METHOD_PREFIX);
+      if (m) {
+        method = method ?? m[1];
+        url = m[2];
+      }
+      try {
+        out.push({ url: new URL(url, origin).href, method: method?.toUpperCase(), raw: e });
+      } catch {}
+    }
+  }
+  return out;
+}
+
+/** Same host and path, where the manifest may use :param or {param} segments; query and trailing slash ignored. */
+export function routeMatches(entryUrl, probedUrl) {
+  const a = new URL(entryUrl), b = new URL(probedUrl);
+  if (a.host !== b.host) return false;
+  const parts = (u) => (decodeURIComponent(u.pathname).replace(/\/+$/, "") || "/").split("/");
+  const as = parts(a), bs = parts(b);
+  return as.length === bs.length && as.every((s, i) => s === bs[i] || /^:\w+$/.test(s) || /^\{[^}]+\}$/.test(s));
+}
+
+const usdOf = (value) => {
+  const m = String(value ?? "").match(/^\$?\s*(\d+(?:\.\d+)?)\s*(?:USDC?|USD)?$/i);
+  return m ? Number(m[1]) : null;
+};
+
+/** What a manifest entry (or the manifest itself, host-wide) says about payment, for comparison with the live 402. */
+function declaredTerms(entry, doc) {
+  const raw = entry.raw && typeof entry.raw === "object" ? entry.raw : {};
+  const accepts = [raw.accepts, raw.resource?.accepts, doc.accepts].find(Array.isArray) ?? [];
+  const list = (...values) => values.flat().filter((v) => typeof v === "string" && v);
+  const payTo = list(raw.payTo, accepts.map((a) => a.payTo), doc.payTo).map((p) => p.toLowerCase());
+  // Only ids that can be compared: CAIP-2 or the v1 names; labels such as "mainnet" are reported separately
+  const allNetworks = list(raw.network, accepts.map((a) => a.network), typeof doc.network === "string" ? doc.network : [])
+    .map((n) => V1_NETWORKS[n] ?? n);
+  const network = allNetworks.filter((n) => /^[-a-z0-9]{3,8}:.+$/.test(n));
+  const vague = allNetworks.filter((n) => !network.includes(n));
+  const prices = [];
+  for (const v of [raw.price, ...accepts.map((a) => a.price)]) if (usdOf(v) !== null) prices.push(usdOf(v));
+  for (const a of accepts) {
+    const amount = a.amount ?? a.maxAmountRequired;
+    const net = V1_NETWORKS[a.network] ?? a.network;
+    if (/^\d+$/.test(String(amount ?? "")) && USDC[net]?.toLowerCase() === String(a.asset || "").toLowerCase()) prices.push(Number(amount) / 1e6);
+  }
+  return { payTo: [...new Set(payTo)], network: [...new Set(network)], vague: [...new Set(vague)], prices: [...new Set(prices)] };
+}
+
+/**
+ * /.well-known/x402 is what crawlers fetch first (773 hosts served one in October 2026). Checks that the paid
+ * route is listed there and that any terms the manifest repeats agree with the live 402, which is what
+ * clients actually pay against.
+ */
+export async function checkWellKnown(url, method, challenge) {
+  const S = "Well-known manifest";
+  const origin = new URL(url).origin;
+  let doc;
+  try {
+    const { res } = await timedFetch(`${origin}/.well-known/x402`, { headers: { accept: "application/json" } }, 20_000);
+    if (res.status === 404) return [info(S, "no /.well-known/x402", "Optional today; the Domain Discovery WG is standardising it. Crawlers fetch it first.")];
+    if (!res.ok) return [warn(S, `/.well-known/x402 answers ${res.status}`)];
+    doc = JSON.parse(await res.text());
+  } catch (err) {
+    return [warn(S, `/.well-known/x402 is not readable JSON (${err.name === "SyntaxError" ? "invalid JSON" : err.message})`)];
+  }
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return [warn(S, "/.well-known/x402 is not a JSON object")];
+
+  const entries = manifestEntries(doc, origin);
+  const out = [ok(S, `found /.well-known/x402 (${entries.length} route${entries.length === 1 ? "" : "s"}${doc.openapi ? ", links an OpenAPI document" : ""})`)];
+  if (!entries.length) {
+    out.push(warn(S, "no routes found under resources, items, endpoints or routes", "Clients cannot tell which routes are paid from this manifest."));
+    return out;
+  }
+  const matches = entries.filter((e) => routeMatches(e.url, url) && (!e.method || e.method === method));
+  if (!matches.length) {
+    out.push(warn(S, `${method} ${new URL(url).pathname} is not listed`, "Crawlers that start from the manifest will not find this paid route."));
+    return out;
+  }
+  out.push(ok(S, `${method} ${new URL(url).pathname} is listed as ${matches[0].url.replace(origin, "")}`));
+  if (challenge.error) return out;
+
+  // Compare what the manifest declares with what the live 402 asks for; the 402 is what gets paid
+  const live = challenge.data.accepts ?? [];
+  const livePayTo = live.map((a) => String(a.payTo || "").toLowerCase());
+  const liveNetworks = live.map((a) => (challenge.version >= 2 ? a.network : V1_NETWORKS[a.network] ?? a.network));
+  const livePrices = live.flatMap((a) => {
+    const net = challenge.version >= 2 ? a.network : V1_NETWORKS[a.network] ?? a.network;
+    const amount = challenge.version >= 2 ? a.amount : a.maxAmountRequired;
+    return USDC[net]?.toLowerCase() === String(a.asset || "").toLowerCase() && /^\d+$/.test(String(amount)) ? [Number(amount) / 1e6] : [];
+  });
+  const terms = declaredTerms(matches[0], doc);
+  const compared = [];
+  if (terms.payTo.length) {
+    compared.push("payTo");
+    if (!livePayTo.some((p) => terms.payTo.includes(p))) out.push(warn(S, "payTo in the manifest differs from the 402", "Clients pay the live 402, so the manifest is stale or points elsewhere."));
+  }
+  if (terms.network.length) {
+    compared.push("network");
+    if (!liveNetworks.some((n) => terms.network.includes(n))) out.push(warn(S, `manifest networks (${terms.network.join(", ")}) differ from the 402 (${liveNetworks.join(", ")})`));
+  }
+  if (terms.vague.length) out.push(info(S, `manifest names the network as "${terms.vague.join('", "')}", not a CAIP-2 id, so it cannot be compared`));
+  if (terms.prices.length && livePrices.length) {
+    compared.push("price");
+    if (!livePrices.some((p) => terms.prices.some((q) => Math.abs(p - q) < 1e-9))) {
+      out.push(warn(S, `manifest price $${terms.prices.join(", $")} differs from the 402 ($${livePrices.join(", $")})`, "Agents that budget from the manifest will be surprised at payment time."));
+    }
+  }
+  if (compared.length && !out.some((r) => r.level === "warn")) out.push(ok(S, `${compared.join(", ")} match the live 402`));
+  else if (!compared.length) out.push(info(S, "the manifest lists the route without payment terms, so there is nothing to compare"));
+
+  // Metadata in one place but not the other (what a "these two must mirror" rule would check)
+  const raw = matches[0].raw && typeof matches[0].raw === "object" ? matches[0].raw : {};
+  const manifestDescription = raw.description ?? raw.summary ?? raw.resource?.description;
+  const liveDescription = challenge.data.resource?.description;
+  if (manifestDescription && !liveDescription) out.push(info(S, "description is in the manifest but not in the 402"));
+  if (!manifestDescription && liveDescription && typeof matches[0].raw === "object") out.push(info(S, "description is in the 402 but not in the manifest entry"));
+  return out;
+}
+
+export async function runChecks(url, { method = "GET", body, openapi = true, bazaar = true, wellKnown = true } = {}) {
   const results = [...checkHost(url)];
   let probe;
   try {
@@ -316,6 +455,7 @@ export async function runChecks(url, { method = "GET", body, openapi = true, baz
   const icon = challengeResults.find((r) => r.iconUrl)?.iconUrl;
   if (icon) results.push(...(await checkIcon(icon)));
   results.push(...checkBazaarExtension(challenge));
+  if (wellKnown) results.push(...(await checkWellKnown(url, method, challenge)));
   if (openapi) results.push(...(await checkOpenApi(url)));
   if (bazaar) results.push(...(await checkBazaarIndex(url, challenge)));
   return results;
