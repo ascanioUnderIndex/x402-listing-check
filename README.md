@@ -12,15 +12,18 @@ Nothing is paid: every request is an unpaid probe, the same kind registries send
 
 Shipping an x402 endpoint is easy. Getting it to show up properly in the CDP Bazaar, agentic.market, x402scan and x402-list is not, because each one reads a different part of your 402 response and drops what it doesn't like without telling you.
 
-We ran it on 40 busy services from the CDP Bazaar: the ones with the most unique payers among the first 1,000 listed resources, one per domain, on 2026-10-21. 38 answered the unpaid probe with a 402 (the other 2 validate a POST body first):
+We ran it on the 200 busiest hosts in the CDP Bazaar (by unique payers, one route each, 2026-10-22). 196 answered the unpaid probe with a 402:
 
-| Issue | Services |
+| Issue | Hosts |
 |:---|:---:|
-| No `iconUrl`: catalogs show a generic icon | 25 of 38 |
-| `PAYMENT-REQUIRED` not exposed to browsers (CORS) | 22 of 38 |
-| No `serviceName`: agentic.market lists the service without a name | 14 of 38 |
-| No `tags` | 14 of 38 |
-| Tags silently dropped by the Bazaar (more than 5, or too long) | 8 of 38 |
+| No `iconUrl`: catalogs show a generic icon | 131 of 196 |
+| `PAYMENT-REQUIRED` not exposed to browsers (CORS) | 131 of 196 |
+| No `serviceName`: agentic.market lists the service without a name | 47 of 196 |
+| No `tags` | 49 of 196 |
+| Tags silently dropped by the Bazaar (more than 5, or too long) | 38 of 196 |
+| Paid route missing from its own `/.well-known/x402` | 14 of 130 manifests |
+
+Method, limits and the script that reproduces these numbers: [`scan/`](scan/).
 
 ## What it checks
 
@@ -30,6 +33,7 @@ We ran it on 40 busy services from the CDP Bazaar: the ones with the most unique
 | **402 challenge** | the route answers `402` to an unpaid request (not `200`, `400`, `405`); response time (cold starts make agents give up); `PAYMENT-REQUIRED` exposed in CORS; x402 v1 (JSON body) and v2 (`PAYMENT-REQUIRED` header) |
 | **Payment options** | CAIP-2 network ids, integer amounts in atomic units, price in dollars for USDC, valid `payTo`, the EIP-712 `extra.name` / `extra.version` EVM `exact` payments need, `maxTimeoutSeconds` |
 | **Resource metadata** | `resource.url` matches what you called (catches `http://` behind a TLS-terminating proxy), description, mimeType, and `serviceName` / `tags` / `iconUrl` run through the Bazaar's own sanitizer, so you see what survives; the icon is fetched |
+| **Well-known manifest** | fetches `/.well-known/x402` (any of the shapes deployed today: `resources`, `items`, `endpoints`, `routes`; URLs, `METHOD /path` strings or objects), checks the paid route is listed (`:param` / `{param}` templates match), and compares any `payTo`, network or price it restates with the live 402 |
 | **Bazaar discovery** | `extensions.bazaar` present and validated with the official `@x402/extensions` validator; input shape, `routeTemplate` for path parameters, output example |
 | **OpenAPI** | finds `/openapi.json` or `/.well-known/openapi.json` and probes every listed operation: registries expect a 402 from each, so a free route listed there looks broken; `x-payment-info`, `x-guidance` |
 | **Bazaar index** | looks the resource up in the CDP Bazaar and shows when it was last updated and its 30-day calls and unique payers |
@@ -42,6 +46,7 @@ We ran it on 40 busy services from the CDP Bazaar: the ones with the most unique
 --json          machine-readable output, for CI
 --no-openapi    skip the OpenAPI probe
 --no-bazaar     skip the CDP Bazaar lookup
+--no-well-known skip the /.well-known/x402 manifest check
 ```
 
 The exit code is `1` when a check fails, so it can gate a deploy:
@@ -60,7 +65,7 @@ Host
        x402-list.com charges a one-off $1 (x402) review fee for these; a custom domain avoids it.
 
 402 challenge
-  ✅ answers 402 Payment Required (409 ms)
+  ✅ answers 402 Payment Required (342 ms)
   ✅ x402 v2, read from the PAYMENT-REQUIRED header
 
 Payment option 1
@@ -79,6 +84,9 @@ Bazaar discovery
   ℹ️  input: http GET, path params name
   ✅ routeTemplate /api/subculture/:name
   ✅ output example present
+
+Well-known manifest
+  ℹ️  no /.well-known/x402
 
 OpenAPI
   ✅ found /openapi.json (OpenAPI 3.1.0)
