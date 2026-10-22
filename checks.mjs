@@ -297,33 +297,69 @@ export async function checkBazaarIndex(url, challenge) {
 }
 
 const METHOD_PREFIX = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)$/i;
+const ROUTE_KEYS = ["resources", "items", "endpoints", "routes", "services", "tools", "accepts"];
+const HTTP_METHODS = ["get", "post", "put", "patch", "delete", "head", "options"];
+const looksLikeRoute = (s) => s.startsWith("/") || /^https?:\/\//.test(s) || METHOD_PREFIX.test(s);
 
 /**
  * Entries of a /.well-known/x402 manifest, whatever the shape: plain URLs, "METHOD /path" strings,
- * or objects carrying resource/url/path (+ method, accepts, price...). Deployed manifests mix all of these.
+ * objects carrying resource/url/path/endpoint (+ method, accepts, price...), maps keyed by route,
+ * or a whole OpenAPI document. Deployed manifests use all of these.
  */
 export function manifestEntries(doc, origin) {
   const out = [];
-  for (const key of ["resources", "items", "endpoints", "routes"]) {
-    if (!Array.isArray(doc?.[key])) continue;
-    for (const e of doc[key]) {
-      let url, method;
-      if (typeof e === "string") {
-        url = e;
-      } else if (e && typeof e === "object") {
-        const r = e.resource;
-        url = (typeof r === "string" ? r : r?.url) ?? e.url ?? e.path ?? e.endpoint;
-        method = e.method ?? (r && typeof r === "object" ? r.method : undefined);
+  let base = origin;
+  try {
+    const declared = doc?.baseUrl ?? doc?.base_url;
+    if (typeof declared === "string") base = new URL(declared, origin).href;
+  } catch {}
+  const seen = new Set();
+  const add = (url, method, raw) => {
+    if (typeof url !== "string") return;
+    const m = url.match(METHOD_PREFIX);
+    if (m) {
+      method = method ?? m[1];
+      url = m[2];
+    }
+    // "GET+POST", "GET, POST" or ["GET", "POST"] all mean either method
+    if (Array.isArray(method)) method = method.join("+");
+    try {
+      const entry = { url: new URL(url, base).href, method: typeof method === "string" ? method.toUpperCase() : undefined, raw };
+      const key = `${entry.method} ${entry.url}`;
+      if (!seen.has(key)) out.push(entry);
+      seen.add(key);
+    } catch {}
+  };
+  const fromObject = (e, key) => {
+    const r = e.resource;
+    const url = (typeof r === "string" ? r : r?.url) ?? e.url ?? e.path ?? e.endpoint ?? key;
+    add(url, e.method ?? (r && typeof r === "object" ? r.method : undefined), e);
+  };
+  for (const key of ROUTE_KEYS) {
+    const list = doc?.[key];
+    if (Array.isArray(list)) {
+      for (const e of list) {
+        if (typeof e === "string") add(e, undefined, e);
+        else if (e && typeof e === "object") fromObject(e);
       }
-      if (typeof url !== "string") continue;
-      const m = url.match(METHOD_PREFIX);
-      if (m) {
-        method = method ?? m[1];
-        url = m[2];
+    } else if (list && typeof list === "object") {
+      // Keyed by route ({ "/path": {...} }, { "POST /path": {...} }) or by name with the route inside
+      for (const [k, e] of Object.entries(list)) {
+        if (e && typeof e === "object" && !Array.isArray(e)) fromObject(e, looksLikeRoute(k) ? k : undefined);
+        else if (typeof e === "string") add(looksLikeRoute(k) ? k : e, undefined, e);
       }
-      try {
-        out.push({ url: new URL(url, origin).href, method: method?.toUpperCase(), raw: e });
-      } catch {}
+    }
+  }
+  // An OpenAPI document served at the well-known path itself
+  if (doc?.paths && typeof doc.paths === "object") {
+    let server = origin;
+    try {
+      server = new URL(doc.servers?.[0]?.url ?? "/", origin).href;
+    } catch {}
+    for (const [path, ops] of Object.entries(doc.paths)) {
+      for (const [method, op] of Object.entries(ops ?? {})) {
+        if (HTTP_METHODS.includes(method)) add(server.replace(/\/$/, "") + path, method, op);
+      }
     }
   }
   return out;
@@ -339,6 +375,12 @@ export function routeMatches(entryUrl, probedUrl) {
 }
 
 const usdOf = (value) => {
+  // { amount, currency } objects, as in x-payment-info; only fixed prices can be compared
+  if (value && typeof value === "object") {
+    const kind = value.mode ?? value.type;
+    if ((kind && !/^(fixed|exact)$/i.test(kind)) || !/^(USDC?|USD)$/i.test(value.currency ?? "USD")) return null;
+    return usdOf(value.amount);
+  }
   const m = String(value ?? "").match(/^\$?\s*(\d+(?:\.\d+)?)\s*(?:USDC?|USD)?$/i);
   return m ? Number(m[1]) : null;
 };
@@ -346,7 +388,9 @@ const usdOf = (value) => {
 /** What a manifest entry (or the manifest itself, host-wide) says about payment, for comparison with the live 402. */
 function declaredTerms(entry, doc) {
   const raw = entry.raw && typeof entry.raw === "object" ? entry.raw : {};
-  const accepts = [raw.accepts, raw.resource?.accepts, doc.accepts].find(Array.isArray) ?? [];
+  // An entry of a root accepts[] list is itself a payment option
+  const self = raw.scheme || raw.network ? [raw] : undefined;
+  const accepts = [raw.accepts, raw.resource?.accepts, self, doc.accepts].find(Array.isArray) ?? [];
   const list = (...values) => values.flat().filter((v) => typeof v === "string" && v);
   const payTo = list(raw.payTo, accepts.map((a) => a.payTo), doc.payTo).map((p) => p.toLowerCase());
   // Only ids that can be compared: CAIP-2 or the v1 names; labels such as "mainnet" are reported separately
@@ -355,11 +399,12 @@ function declaredTerms(entry, doc) {
   const network = allNetworks.filter((n) => /^[-a-z0-9]{3,8}:.+$/.test(n));
   const vague = allNetworks.filter((n) => !network.includes(n));
   const prices = [];
-  for (const v of [raw.price, ...accepts.map((a) => a.price)]) if (usdOf(v) !== null) prices.push(usdOf(v));
+  for (const v of [raw.price, raw.price_usdc, raw["x-payment-info"]?.price, ...accepts.map((a) => a.price)]) if (usdOf(v) !== null) prices.push(usdOf(v));
   for (const a of accepts) {
     const amount = a.amount ?? a.maxAmountRequired;
     const net = V1_NETWORKS[a.network] ?? a.network;
-    if (/^\d+$/.test(String(amount ?? "")) && USDC[net]?.toLowerCase() === String(a.asset || "").toLowerCase()) prices.push(Number(amount) / 1e6);
+    const asset = String(a.asset || "").toLowerCase();
+    if (/^\d+$/.test(String(amount ?? "")) && (USDC[net]?.toLowerCase() === asset || asset === "usdc")) prices.push(Number(amount) / 1e6);
   }
   return { payTo: [...new Set(payTo)], network: [...new Set(network)], vague: [...new Set(vague)], prices: [...new Set(prices)] };
 }
@@ -384,14 +429,17 @@ export async function checkWellKnown(url, method, challenge) {
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) return [warn(S, "/.well-known/x402 is not a JSON object")];
 
   const entries = manifestEntries(doc, origin);
-  const out = [ok(S, `found /.well-known/x402 (${entries.length} route${entries.length === 1 ? "" : "s"}${doc.openapi ? ", links an OpenAPI document" : ""})`)];
+  const out = [ok(S, `found /.well-known/x402 (${entries.length} route${entries.length === 1 ? "" : "s"}${doc.openapi && !doc.paths ? ", links an OpenAPI document" : doc.paths ? ", is an OpenAPI document" : ""})`)];
   if (!entries.length) {
-    out.push(warn(S, "no routes found under resources, items, endpoints or routes", "Clients cannot tell which routes are paid from this manifest."));
+    out.push(warn(S, "no routes found in any shape the checker reads", "Clients cannot tell which routes are paid from this manifest."));
     return out;
   }
-  const matches = entries.filter((e) => routeMatches(e.url, url) && (!e.method || e.method === method));
+  const matches = entries.filter((e) => routeMatches(e.url, url) && (!e.method || e.method.split(/[^A-Z]+/).includes(method)));
   if (!matches.length) {
-    out.push(warn(S, `${method} ${new URL(url).pathname} is not listed`, "Crawlers that start from the manifest will not find this paid route."));
+    const paged = doc.pagination || doc.next || doc.nextCursor;
+    out.push(paged
+      ? info(S, `${method} ${new URL(url).pathname} is not on the first page of the manifest`, "The manifest is paginated; later pages are not read.")
+      : warn(S, `${method} ${new URL(url).pathname} is not listed`, "Crawlers that start from the manifest will not find this paid route."));
     return out;
   }
   out.push(ok(S, `${method} ${new URL(url).pathname} is listed as ${matches[0].url.replace(origin, "")}`));
