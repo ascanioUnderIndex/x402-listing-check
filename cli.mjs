@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// x402-listing-check <url> [--method POST] [--body '{...}'] [--json] [--no-openapi] [--no-bazaar]
+// x402-listing-check <url> [--method POST] [--body '{...}'] [--json] [--no-openapi] [--no-bazaar] [--no-well-known]
 import { runChecks } from "./checks.mjs";
 
 const args = process.argv.slice(2);
@@ -14,8 +14,9 @@ if (!url || flag("--help") || flag("-h")) {
   console.log(`Usage: x402-listing-check <paid-endpoint-url> [options]
 
 Checks an x402 endpoint the way discovery services see it: the 402 challenge, payment terms,
-Bazaar metadata (serviceName, tags, icon, discovery extension), the OpenAPI paths registries
-probe, hosting rules of x402-list.com, and whether the CDP Bazaar has indexed it.
+Bazaar metadata (serviceName, tags, icon, discovery extension), /.well-known/x402 against the
+live 402, the OpenAPI paths registries probe, hosting rules of x402-list.com, and whether the
+CDP Bazaar has indexed it.
 
 Options:
   --method <M>    HTTP method of the paid route (default GET)
@@ -23,6 +24,7 @@ Options:
   --json         machine-readable output
   --no-openapi    skip the OpenAPI probe
   --no-bazaar     skip the CDP Bazaar lookup
+  --no-well-known skip the /.well-known/x402 manifest check
 
 Nothing is paid: every request is unauthenticated.`);
   process.exit(url ? 0 : 1);
@@ -33,6 +35,7 @@ const results = await runChecks(url, {
   body: option("--body"),
   openapi: !flag("--no-openapi"),
   bazaar: !flag("--no-bazaar"),
+  wellKnown: !flag("--no-well-known"),
 });
 
 if (flag("--json")) {
