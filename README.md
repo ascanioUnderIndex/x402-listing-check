@@ -21,7 +21,7 @@ We ran it on the 200 busiest hosts in the CDP Bazaar (by unique payers, one rout
 | No `serviceName`: agentic.market lists the service without a name | 47 of 196 |
 | No `tags` | 49 of 196 |
 | Tags silently dropped by the Bazaar (more than 5, or too long) | 38 of 196 |
-| Paid route missing from its own `/.well-known/x402` | 14 of 130 manifests |
+| Paid route missing from its own `/.well-known/x402` | 4 of 130 manifests |
 
 Method, limits and the script that reproduces these numbers: [`scan/`](scan/).
 
@@ -33,7 +33,7 @@ Method, limits and the script that reproduces these numbers: [`scan/`](scan/).
 | **402 challenge** | the route answers `402` to an unpaid request (not `200`, `400`, `405`); response time (cold starts make agents give up); `PAYMENT-REQUIRED` exposed in CORS; x402 v1 (JSON body) and v2 (`PAYMENT-REQUIRED` header) |
 | **Payment options** | CAIP-2 network ids, integer amounts in atomic units, price in dollars for USDC, valid `payTo`, the EIP-712 `extra.name` / `extra.version` EVM `exact` payments need, `maxTimeoutSeconds` |
 | **Resource metadata** | `resource.url` matches what you called (catches `http://` behind a TLS-terminating proxy), description, mimeType, and `serviceName` / `tags` / `iconUrl` run through the Bazaar's own sanitizer, so you see what survives; the icon is fetched |
-| **Well-known manifest** | fetches `/.well-known/x402` (any of the shapes deployed today: `resources`, `items`, `endpoints`, `routes`; URLs, `METHOD /path` strings or objects), checks the paid route is listed (`:param` / `{param}` templates match), and compares any `payTo`, network or price it restates with the live 402 |
+| **Well-known manifest** | fetches `/.well-known/x402` (the shapes deployed today: lists under `resources`, `items`, `endpoints`, `routes`, `services`, `tools` or `accepts` holding URLs, `METHOD /path` strings or objects; maps keyed by route; a whole OpenAPI document), checks the paid route is listed (`:param` / `{param}` templates match), and compares any `payTo`, network or price it restates with the live 402 |
 | **Bazaar discovery** | `extensions.bazaar` present and validated with the official `@x402/extensions` validator; input shape, `routeTemplate` for path parameters, output example |
 | **OpenAPI** | finds `/openapi.json` or `/.well-known/openapi.json` and probes every listed operation: registries expect a 402 from each, so a free route listed there looks broken; `x-payment-info`, `x-guidance` |
 | **Bazaar index** | looks the resource up in the CDP Bazaar and shows when it was last updated and its 30-day calls and unique payers |
