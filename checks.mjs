@@ -1,6 +1,7 @@
 // Checks an x402 endpoint the way discovery services see it: the 402 challenge, the payment terms,
 // the Bazaar metadata that catalogs such as agentic.market display, the OpenAPI paths registries probe,
-// and whether the CDP Bazaar has indexed it. Each check returns { section, level, message, hint }.
+// and whether the CDP Bazaar has indexed it. Paid MCP tools are checked over the x402 MCP transport instead of
+// the 402. Each check returns { section, level, message, hint }.
 import {
   sanitizeResourceServiceMetadata,
   validateDiscoveryExtension,
@@ -84,8 +85,13 @@ export function checkHost(url) {
 export function checkChallenge({ url, res, ms, challenge }) {
   const S = "402 challenge";
   const out = [];
+  // x402 over MCP never answers 402 (see checkMcpChallenge), so point there instead of blaming the route
+  const mcpHint = /\/mcp\/?$/.test(new URL(url).pathname) && res.status !== 404
+    ? "This looks like an MCP endpoint. x402 over MCP answers tools/call with a payment-required tool result over HTTP 200, not 402: run with --mcp-tool <name>."
+    : null;
   if (res.status === 402) out.push(ok(S, `answers 402 Payment Required (${ms} ms)`));
-  else if (res.ok) out.push(fail(S, `answers ${res.status} without payment`, "The paid route must answer 402 to an unpaid request; registries treat anything else as not x402."));
+  else if (res.ok) out.push(fail(S, `answers ${res.status} without payment`, mcpHint ?? "The paid route must answer 402 to an unpaid request; registries treat anything else as not x402."));
+  else if (mcpHint) out.push(fail(S, `answers ${res.status} instead of 402`, mcpHint));
   else if (res.status === 405) out.push(fail(S, `answers 405 Method Not Allowed`, "The paid route uses another method; try --method POST."));
   else if (res.status === 400 || res.status === 422) out.push(fail(S, `answers ${res.status} instead of 402`, "The route validates input before charging. Pass a valid body with --body; registries probe with the example body from your Bazaar extension, so keep that example valid."));
   else out.push(fail(S, `answers ${res.status} instead of 402`, "Probe the exact paid URL, with valid parameters."));
@@ -101,6 +107,14 @@ export function checkChallenge({ url, res, ms, challenge }) {
     return out;
   }
   out.push(ok(S, `x402 v${challenge.version}, read from the ${challenge.from}`));
+  out.push(...checkTerms(url, challenge));
+  return out;
+}
+
+/** Payment options and resource metadata, the same for the HTTP and the MCP transport. */
+function checkTerms(url, challenge, { mcp = false } = {}) {
+  const S = mcp ? "MCP payment" : "402 challenge";
+  const out = [];
   const accepts = challenge.data.accepts;
   if (!Array.isArray(accepts) || !accepts.length) {
     out.push(fail(S, "accepts[] is empty", "List at least one payment option."));
@@ -130,17 +144,19 @@ export function checkChallenge({ url, res, ms, challenge }) {
     if (!a.maxTimeoutSeconds) out.push(warn(T, "maxTimeoutSeconds missing", "Clients use it to bound how long a signed authorization stays valid."));
   });
 
-  if (challenge.version >= 2) out.push(...checkResource(url, challenge.data.resource));
+  if (challenge.version >= 2) out.push(...checkResource(url, challenge.data.resource, { mcp }));
   return out;
 }
 
-function checkResource(url, resource) {
+function checkResource(url, resource, { mcp = false } = {}) {
   const S = "Resource metadata";
   const out = [];
   if (!resource) return [fail(S, "resource object missing", "v2 challenges carry resource { url, description, mimeType }.")];
   try {
     const r = new URL(resource.url), u = new URL(url);
-    if (r.protocol !== u.protocol) out.push(fail(S, `resource.url says ${r.protocol}// but you called ${u.protocol}//`, "Usually a proxy terminating TLS (Render, Heroku, Fly). Trust X-Forwarded-Proto, e.g. Express app.set(\"trust proxy\", true)."));
+    // The MCP transport names a tool as mcp://tool/<name>; an https URL on the server's host is fine too
+    if (mcp && r.protocol === "mcp:") out.push(ok(S, `resource.url ${resource.url}`));
+    else if (r.protocol !== u.protocol) out.push(fail(S, `resource.url says ${r.protocol}// but you called ${u.protocol}//`, "Usually a proxy terminating TLS (Render, Heroku, Fly). Trust X-Forwarded-Proto, e.g. Express app.set(\"trust proxy\", true)."));
     else if (r.host !== u.host) out.push(warn(S, `resource.url host ${r.host} differs from ${u.host}`, "Catalogs list the host in resource.url."));
     else out.push(ok(S, `resource.url ${resource.url}`));
   } catch {
@@ -181,6 +197,134 @@ export async function checkIcon(iconUrl) {
   }
 }
 
+const isPaymentRequired = (o) => o && typeof o === "object" && !Array.isArray(o) && "x402Version" in o && Array.isArray(o.accepts);
+
+/**
+ * The x402 MCP transport (specs/transports-v2/mcp.md): an unpaid tools/call returns a tool result with isError: true,
+ * the PaymentRequired object in structuredContent, and the same object JSON-encoded in content[0].text.
+ */
+export function parseMcpPaymentRequired(result) {
+  if (!result || typeof result !== "object") return { error: "tools/call returned no result" };
+  const structured = isPaymentRequired(result.structuredContent) ? result.structuredContent : null;
+  let fromText = null;
+  try {
+    const parsed = JSON.parse(result.content?.[0]?.text ?? "");
+    if (isPaymentRequired(parsed)) fromText = parsed;
+  } catch {}
+  const data = structured ?? fromText;
+  if (!data) return { error: "the tool result carries no PaymentRequired object (x402Version + accepts)" };
+  return {
+    version: data.x402Version ?? 2,
+    data,
+    from: structured ? "tool result structuredContent" : "tool result content[0].text",
+    structured: !!structured,
+    text: !!fromText,
+    same: !!structured && !!fromText && JSON.stringify(structured) === JSON.stringify(fromText),
+  };
+}
+
+/** One JSON-RPC message over MCP Streamable HTTP; the answer comes back as JSON or as a text/event-stream. */
+async function mcpPost(url, message, session, timeoutMs = 30_000) {
+  const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+  if (session.id) headers["mcp-session-id"] = session.id;
+  if (session.protocolVersion) headers["mcp-protocol-version"] = session.protocolVersion;
+  const { res, ms } = await timedFetch(url, { method: "POST", headers, body: JSON.stringify(message) }, timeoutMs);
+  const text = await res.text();
+  if (message.id === undefined) return { res, ms };
+  let reply = null;
+  const pick = (m) => (m && m.id === message.id ? m : null);
+  if ((res.headers.get("content-type") || "").includes("text/event-stream")) {
+    for (const event of text.split(/\r?\n\r?\n/)) {
+      const data = event.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trimStart()).join("\n");
+      try {
+        reply = pick(JSON.parse(data)) ?? reply;
+      } catch {}
+    }
+  } else {
+    try {
+      const parsed = JSON.parse(text);
+      reply = Array.isArray(parsed) ? parsed.map(pick).find(Boolean) ?? null : pick(parsed);
+    } catch {}
+  }
+  return { res, ms, reply, text };
+}
+
+/** Opens an MCP session and calls the tool without payment, as an indexer would. Never pays. */
+export async function probeMcp(url, tool, args = {}) {
+  const session = {};
+  const init = await mcpPost(url, {
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "x402-listing-check", version: "0.3.0" } },
+  }, session, 60_000);
+  if (!init.reply?.result) return { stage: "initialize", res: init.res, ms: init.ms, reply: init.reply, text: init.text };
+  session.id = init.res.headers.get("mcp-session-id") ?? undefined;
+  session.protocolVersion = init.reply.result.protocolVersion;
+  await mcpPost(url, { jsonrpc: "2.0", method: "notifications/initialized" }, session);
+  const list = await mcpPost(url, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, session);
+  const tools = list.reply?.result?.tools?.map((t) => t.name) ?? null;
+  const call = await mcpPost(url, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: tool, arguments: args } }, session);
+  return { stage: "call", initMs: init.ms, serverInfo: init.reply.result.serverInfo, tools, res: call.res, ms: call.ms, reply: call.reply, text: call.text };
+}
+
+export function checkMcpChallenge({ url, tool, probe }) {
+  const S = "MCP payment";
+  const out = [];
+  if (probe.stage === "initialize") {
+    const why = probe.reply?.error ? `JSON-RPC error ${probe.reply.error.code}: ${probe.reply.error.message}` : `HTTP ${probe.res.status}`;
+    out.push(fail(S, `initialize failed (${why})`, "Pass the MCP Streamable HTTP endpoint itself, usually https://host/mcp."));
+    return { results: out, challenge: { error: "no MCP session" } };
+  }
+  out.push(ok(S, `MCP session opened (${probe.serverInfo?.name ?? "unnamed server"}${probe.serverInfo?.version ? ` ${probe.serverInfo.version}` : ""}, ${probe.initMs} ms)`));
+  if (probe.initMs > 10_000) out.push(warn(S, `initialize took ${(probe.initMs / 1000).toFixed(1)} s`, "Looks like a cold start. Many agents give up before that; keep the service warm."));
+  if (probe.tools && !probe.tools.includes(tool)) {
+    out.push(fail(S, `tools/list has no tool "${tool}"`, `Available: ${probe.tools.slice(0, 20).join(", ") || "none"}.`));
+    return { results: out, challenge: { error: "tool not found" } };
+  }
+
+  // Some MCP servers also answer a real HTTP 402 with the PAYMENT-REQUIRED header, as for HTTP routes
+  if (probe.res.status === 402) {
+    const challenge = parseChallenge(probe.res, probe.text);
+    out.push(ok(S, `tools/call ${tool} answers HTTP 402`));
+    if (challenge.error) out.push(fail(S, challenge.error));
+    else out.push(ok(S, `x402 v${challenge.version}, read from the ${challenge.from}`), ...checkTerms(url, challenge, { mcp: true }));
+    return { results: out, challenge };
+  }
+  if (!probe.reply) {
+    out.push(fail(S, `tools/call ${tool} answered HTTP ${probe.res.status} with no JSON-RPC reply`));
+    return { results: out, challenge: { error: "no reply" } };
+  }
+  if (probe.reply.error) {
+    out.push(fail(S, `tools/call ${tool} returned JSON-RPC error ${probe.reply.error.code}: ${probe.reply.error.message}`,
+      "Payment-required is signalled as a tool result with isError: true, not as a JSON-RPC error. If the tool needs arguments, pass them with --mcp-args '{...}'."));
+    return { results: out, challenge: { error: "JSON-RPC error" } };
+  }
+  const result = probe.reply.result;
+  const challenge = parseMcpPaymentRequired(result);
+  if (challenge.error) {
+    // Some servers describe the price in prose (or point to their HTTP API) instead of returning a payable object
+    const text = (result?.content ?? []).map((c) => c?.text ?? "").join(" ");
+    if (/payment[_ ]required|x402|usdc/i.test(text)) {
+      out.push(fail(S, `tools/call ${tool} describes a payment in text but returns no x402 PaymentRequired object`,
+        "Clients that pay over the x402 MCP transport look for isError: true with PaymentRequired in structuredContent; instructions in prose cannot be paid."));
+    } else if (result?.isError) {
+      out.push(fail(S, `tools/call ${tool} failed without payment terms: ${challenge.error}`, "Return the PaymentRequired object in structuredContent and in content[0].text. If the tool rejected its input, pass valid arguments with --mcp-args."));
+    } else {
+      out.push(fail(S, `tools/call ${tool} answered without asking for payment`, "The paid tool must return a payment-required result to an unpaid call."));
+    }
+    return { results: out, challenge };
+  }
+  out.push(ok(S, `tools/call ${tool} asks for payment over HTTP ${probe.res.status} (${probe.ms} ms)`));
+  if (result.isError !== true) out.push(fail(S, "the payment-required result is not marked isError: true", "Clients detect payment-required tool results by isError: true (x402 MCP transport)."));
+  if (!challenge.structured) out.push(fail(S, "PaymentRequired is only in content[0].text, not in structuredContent", "The MCP transport requires both; clients read structuredContent first."));
+  else if (!challenge.text) out.push(warn(S, "content[0].text does not carry the PaymentRequired JSON", "The MCP transport requires both, for clients that cannot read structuredContent."));
+  else if (!challenge.same) out.push(warn(S, "structuredContent and content[0].text differ", "Both should hold the same PaymentRequired object."));
+  else out.push(ok(S, "PaymentRequired in structuredContent and content[0].text"));
+  out.push(ok(S, `x402 v${challenge.version}, read from the ${challenge.from}`));
+  out.push(info(S, "an indexer that probes this URL for HTTP 402 sees no challenge", "Say which transport the resource uses in /.well-known/x402 (a transport field is proposed in the Domain Discovery WG, issue #11)."));
+  out.push(...checkTerms(url, challenge, { mcp: true }));
+  return { results: out, challenge };
+}
+
 export function checkBazaarExtension(challenge) {
   const S = "Bazaar discovery";
   if (challenge.error) return [];
@@ -202,7 +346,7 @@ export function checkBazaarExtension(challenge) {
   if (!result.valid) out.push(warn(S, `the official validator (@x402/extensions) rejects the extension: ${(result.errors || []).join("; ")}`, "Facilitators may still index it, but other catalogs validate strictly. Check the info and schema fields."));
   else out.push(ok(S, "extension passes the official schema (@x402/extensions)"));
   const input = ext.info?.input ?? {};
-  out.push(info(S, `input: ${input.type ?? "?"} ${input.method ?? ""}${input.pathParams ? `, path params ${Object.keys(input.pathParams).join(", ")}` : ""}${input.queryParams && Object.keys(input.queryParams).length ? `, query ${Object.keys(input.queryParams).join(", ")}` : ""}`));
+  out.push(info(S, `input: ${input.type ?? "?"} ${input.method ?? input.toolName ?? ""}${input.pathParams ? `, path params ${Object.keys(input.pathParams).join(", ")}` : ""}${input.queryParams && Object.keys(input.queryParams).length ? `, query ${Object.keys(input.queryParams).join(", ")}` : ""}`));
   if (input.pathParams && !ext.routeTemplate) out.push(warn(S, "path parameters but no routeTemplate", "Without it every distinct URL is indexed as its own resource."));
   if (ext.routeTemplate) out.push(ok(S, `routeTemplate ${ext.routeTemplate}`));
   if (ext.info?.output?.example === undefined) out.push(warn(S, "no output example", "Catalogs show the example response; agents use it to decide whether to pay."));
@@ -265,14 +409,14 @@ export async function checkOpenApi(url) {
 }
 
 /** Looks the resource up in the CDP Bazaar (the index agentic.market and x402 discovery clients read). */
-export async function checkBazaarIndex(url, challenge) {
+export async function checkBazaarIndex(url, challenge, { mcpTool } = {}) {
   const S = "Bazaar index";
   if (challenge.error) return [];
   const payTo = challenge.data.accepts?.[0]?.payTo;
   const host = new URL(url).host;
   const routeTemplate = challenge.data.extensions?.bazaar?.routeTemplate;
   const wanted = (u) => {
-    if (u === url.split("?")[0]) return true;
+    if (u === url.split("?")[0] || (mcpTool && u === `mcp://tool/${mcpTool}`)) return true;
     if (!routeTemplate) return false;
     const re = new RegExp("^" + `${new URL(url).origin}${routeTemplate}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/:[A-Za-z_]+/g, "[^/]+") + "$");
     return u === `${new URL(url).origin}${routeTemplate}` || re.test(u);
@@ -352,6 +496,15 @@ export function manifestEntries(doc, origin) {
       }
     }
   }
+  // A host-level MCP endpoint: "mcp": "https://host/mcp", "mcp": { endpoint, transport, tools }, or
+  // "access": { type: "mcp", url }. Its tools are paid over the MCP transport, not with a 402.
+  for (const key of ["mcp", "access"]) {
+    const m = doc?.[key];
+    if (typeof m === "string" && key === "mcp") add(m, undefined, { transport: "mcp", mcpEndpoint: true });
+    else if (m && typeof m === "object" && !Array.isArray(m) && (key === "mcp" || /mcp/i.test(m.type ?? ""))) {
+      add(m.endpoint ?? m.url, undefined, { ...m, transport: m.transport ?? "mcp", mcpEndpoint: true });
+    }
+  }
   // An OpenAPI document served at the well-known path itself
   if (doc?.paths && typeof doc.paths === "object") {
     let server = origin;
@@ -416,7 +569,7 @@ function declaredTerms(entry, doc) {
  * route is listed there and that any terms the manifest repeats agree with the live 402, which is what
  * clients actually pay against.
  */
-export async function checkWellKnown(url, method, challenge) {
+export async function checkWellKnown(url, method, challenge, { mcpTool } = {}) {
   const S = "Well-known manifest";
   const origin = new URL(url).origin;
   let doc;
@@ -436,20 +589,43 @@ export async function checkWellKnown(url, method, challenge) {
     out.push(warn(S, "no routes found in any shape the checker reads", "Clients cannot tell which routes are paid from this manifest."));
     return out;
   }
-  const listedAs = (e) => (routeMatches(e.url, url) ? e.url : e.template && routeMatches(e.template, url) ? e.template : null);
-  const matches = entries.filter((e) => listedAs(e) && (!e.method || e.method.split(/[^A-Z]+/).includes(method)));
+  // An MCP tool may be listed by its endpoint URL or as mcp://tool/<name> (the resource.url the MCP transport uses)
+  const toolUrl = mcpTool ? `mcp://tool/${mcpTool}` : null;
+  const listedAs = (e) => (toolUrl && e.url === toolUrl ? e.url : routeMatches(e.url, url) ? e.url : e.template && routeMatches(e.template, url) ? e.template : null);
+  const namesTool = (e) => e.url === toolUrl || [e.raw?.tool, e.raw?.name, e.raw?.toolName].includes(mcpTool) || (Array.isArray(e.raw?.tools) && e.raw.tools.includes(mcpTool));
+  const matches = entries.filter((e) => listedAs(e) && (e.url === toolUrl || !e.method || e.method.split(/[^A-Z]+/).includes(method)));
+  if (mcpTool) matches.sort((a, b) => namesTool(b) - namesTool(a));
+  const label = mcpTool ? `MCP tool ${mcpTool} (${new URL(url).pathname})` : `${method} ${new URL(url).pathname}`;
   if (!matches.length) {
     const paged = doc.pagination || doc.next || doc.nextCursor;
     out.push(paged
-      ? info(S, `${method} ${new URL(url).pathname} is not on the first page of the manifest`, "The manifest is paginated; later pages are not read.")
-      : warn(S, `${method} ${new URL(url).pathname} is not listed`, "Crawlers that start from the manifest will not find this paid route."));
+      ? info(S, `${label} is not on the first page of the manifest`, "The manifest is paginated; later pages are not read.")
+      : warn(S, `${label} is not listed`, "Crawlers that start from the manifest will not find this paid route."));
     return out;
   }
   const shown = listedAs(matches[0]);
-  out.push(ok(S, `${method} ${new URL(url).pathname} is listed as ${decodeURIComponent(shown.replace(origin, ""))}${shown === matches[0].template ? " (routeTemplate)" : ""}`));
+  out.push(ok(S, `${label} is listed as ${decodeURIComponent(shown.replace(origin, ""))}${shown === matches[0].template ? " (routeTemplate)" : ""}`));
+
+  // Indexers probe listed resources for a 402; an MCP tool never sends one, so the entry has to say how it is served
+  const transport = [matches[0].raw?.transport, doc.transport].find((t) => typeof t === "string");
+  const isMcp = (t) => /mcp|streamable-http|sse/i.test(t);
+  if (mcpTool) {
+    if (matches[0].raw?.mcpEndpoint) out.push(ok(S, `listed as the manifest's MCP endpoint${transport && transport !== "mcp" ? ` (transport "${transport}")` : ""}`));
+    else if (!transport) out.push(info(S, "the entry does not declare its transport", "Indexers that expect HTTP 402 from every listed resource will mark this MCP tool as failing. A transport field is proposed in the Domain Discovery WG (issue #11)."));
+    else if (isMcp(transport)) out.push(ok(S, `the entry declares transport "${transport}"`));
+    else out.push(warn(S, `the entry declares transport "${transport}", but the tool answers over MCP`));
+    const tools = matches[0].raw?.tools;
+    if (Array.isArray(tools) && tools.every((t) => typeof t === "string") && !tools.includes(mcpTool)) {
+      out.push(warn(S, `the manifest's MCP tool list does not include ${mcpTool}`, "Crawlers that read the tool list will not know this tool exists."));
+    }
+  } else if (transport && isMcp(transport) && !challenge.error) {
+    out.push(warn(S, `the entry declares transport "${transport}", but the route answers HTTP 402`, "Check the entry describes this route."));
+  }
   if (challenge.error) return out;
 
   // Compare what the manifest declares with what the live 402 asks for; the 402 is what gets paid
+  const the402 = mcpTool ? "the payment-required result" : "the 402";
+  const live402 = mcpTool ? "the live payment requirement" : "the live 402";
   const live = challenge.data.accepts ?? [];
   const livePayTo = live.map((a) => String(a.payTo || "").toLowerCase());
   const liveNetworks = live.map((a) => (challenge.version >= 2 ? a.network : V1_NETWORKS[a.network] ?? a.network));
@@ -462,42 +638,63 @@ export async function checkWellKnown(url, method, challenge) {
   const compared = [];
   if (terms.payTo.length) {
     compared.push("payTo");
-    if (!livePayTo.some((p) => terms.payTo.includes(p))) out.push(warn(S, "payTo in the manifest differs from the 402", "Clients pay the live 402, so the manifest is stale or points elsewhere."));
+    if (!livePayTo.some((p) => terms.payTo.includes(p))) out.push(warn(S, `payTo in the manifest differs from ${the402}`, `Clients pay ${live402}, so the manifest is stale or points elsewhere.`));
   }
   if (terms.network.length) {
     compared.push("network");
-    if (!liveNetworks.some((n) => terms.network.includes(n))) out.push(warn(S, `manifest networks (${terms.network.join(", ")}) differ from the 402 (${liveNetworks.join(", ")})`));
+    if (!liveNetworks.some((n) => terms.network.includes(n))) out.push(warn(S, `manifest networks (${terms.network.join(", ")}) differ from ${the402} (${liveNetworks.join(", ")})`));
   }
   if (terms.vague.length) out.push(info(S, `manifest names the network as "${terms.vague.join('", "')}", not a CAIP-2 id, so it cannot be compared`));
   if (terms.prices.length && livePrices.length) {
     compared.push("price");
     if (!livePrices.some((p) => terms.prices.some((q) => Math.abs(p - q) < 1e-9))) {
-      out.push(warn(S, `manifest price $${terms.prices.join(", $")} differs from the 402 ($${livePrices.join(", $")})`, "Agents that budget from the manifest will be surprised at payment time."));
+      out.push(warn(S, `manifest price $${terms.prices.join(", $")} differs from ${the402} ($${livePrices.join(", $")})`, "Agents that budget from the manifest will be surprised at payment time."));
     }
   }
-  if (compared.length && !out.some((r) => r.level === "warn")) out.push(ok(S, `${compared.join(", ")} match the live 402`));
+  if (compared.length && !out.some((r) => r.level === "warn")) out.push(ok(S, `${compared.join(", ")} match ${live402}`));
   else if (!compared.length) out.push(info(S, "the manifest lists the route without payment terms, so there is nothing to compare"));
 
   // Metadata in one place but not the other (what a "these two must mirror" rule would check)
   const raw = matches[0].raw && typeof matches[0].raw === "object" ? matches[0].raw : {};
   const manifestDescription = raw.description ?? raw.summary ?? raw.resource?.description;
   const liveDescription = challenge.data.resource?.description;
-  if (manifestDescription && !liveDescription) out.push(info(S, "description is in the manifest but not in the 402"));
-  if (!manifestDescription && liveDescription && typeof matches[0].raw === "object") out.push(info(S, "description is in the 402 but not in the manifest entry"));
+  if (manifestDescription && !liveDescription) out.push(info(S, `description is in the manifest but not in ${the402}`));
+  if (!manifestDescription && liveDescription && typeof matches[0].raw === "object" && !raw.mcpEndpoint) out.push(info(S, `description is in ${the402} but not in the manifest entry`));
   return out;
 }
 
-export async function runChecks(url, { method = "GET", body, openapi = true, bazaar = true, wellKnown = true } = {}) {
+const requestFailed = (err) => {
+  const code = err.cause?.code;
+  return code === "ENOTFOUND" ? "host not found (DNS)" : code === "ECONNREFUSED" ? "connection refused" : err.name === "TimeoutError" ? "no answer within 60 s" : (code || err.cause?.message || err.message);
+};
+
+export async function runChecks(url, { method = "GET", body, openapi = true, bazaar = true, wellKnown = true, mcpTool, mcpArgs = {} } = {}) {
   const results = [...checkHost(url)];
+  if (mcpTool) {
+    let probe;
+    try {
+      probe = await probeMcp(url, mcpTool, mcpArgs);
+    } catch (err) {
+      results.push(fail("MCP payment", `request failed: ${requestFailed(err)}`, "Check the URL is the MCP Streamable HTTP endpoint, usually https://host/mcp."));
+      return results;
+    }
+    const { results: mcpResults, challenge } = checkMcpChallenge({ url, tool: mcpTool, probe });
+    results.push(...mcpResults.map(({ iconUrl, ...r }) => r));
+    const icon = mcpResults.find((r) => r.iconUrl)?.iconUrl;
+    if (icon) results.push(...(await checkIcon(icon)));
+    results.push(...checkBazaarExtension(challenge));
+    if (wellKnown) results.push(...(await checkWellKnown(url, "POST", challenge, { mcpTool })));
+    if (openapi) results.push(...(await checkOpenApi(url)));
+    if (bazaar) results.push(...(await checkBazaarIndex(url, challenge, { mcpTool })));
+    return results;
+  }
   let probe;
   try {
     const headers = { accept: "application/json", origin: "https://x402-listing-check.local" };
     if (body !== undefined) headers["content-type"] = "application/json";
     probe = await timedFetch(url, { method, headers, body });
   } catch (err) {
-    const code = err.cause?.code;
-    const why = code === "ENOTFOUND" ? "host not found (DNS)" : code === "ECONNREFUSED" ? "connection refused" : err.name === "TimeoutError" ? "no answer within 60 s" : (code || err.cause?.message || err.message);
-    results.push(fail("402 challenge", `request failed: ${why}`, "Check the URL is the full public address of the paid route."));
+    results.push(fail("402 challenge", `request failed: ${requestFailed(err)}`, "Check the URL is the full public address of the paid route."));
     return results;
   }
   const bodyText = await probe.res.text();

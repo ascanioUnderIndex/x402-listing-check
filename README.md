@@ -4,6 +4,9 @@ Check an [x402](https://x402.org) endpoint the way discovery services see it, be
 
 ```bash
 npx x402-listing-check https://your-api.example.com/v1/paid-route
+
+# a paid MCP tool
+npx x402-listing-check https://your-api.example.com/mcp --mcp-tool your_tool
 ```
 
 Nothing is paid: every request is an unpaid probe, the same kind registries send.
@@ -31,9 +34,10 @@ Method, limits and the script that reproduces these numbers: [`scan/`](scan/).
 |:---|:---|
 | **Host** | https, public hostname; x402-list.com's rules ($1 review fee on free compute hosts such as onrender.com or vercel.app, refusal of static hosts and dev tunnels) |
 | **402 challenge** | the route answers `402` to an unpaid request (not `200`, `400`, `405`); response time (cold starts make agents give up); `PAYMENT-REQUIRED` exposed in CORS; x402 v1 (JSON body) and v2 (`PAYMENT-REQUIRED` header) |
+| **MCP payment** | with `--mcp-tool`: opens an MCP Streamable HTTP session, calls the tool unpaid and checks the [x402 MCP transport](https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/mcp.md): a tool result with `isError: true` and the `PaymentRequired` object in both `structuredContent` and `content[0].text`. Flags tools that answer for free, return a JSON-RPC error instead, or only describe the price in prose |
 | **Payment options** | CAIP-2 network ids, integer amounts in atomic units, price in dollars for USDC, valid `payTo`, the EIP-712 `extra.name` / `extra.version` EVM `exact` payments need, `maxTimeoutSeconds` |
 | **Resource metadata** | `resource.url` matches what you called (catches `http://` behind a TLS-terminating proxy), description, mimeType, and `serviceName` / `tags` / `iconUrl` run through the Bazaar's own sanitizer, so you see what survives; the icon is fetched |
-| **Well-known manifest** | fetches `/.well-known/x402` (the shapes deployed today: lists under `resources`, `items`, `endpoints`, `routes`, `services`, `tools` or `accepts` holding URLs, `METHOD /path` strings or objects; maps keyed by route; a whole OpenAPI document), checks the paid route is listed (`:param` / `{param}` templates match, and an entry's `routeTemplate`, as in the Bazaar extension, lets a probeable example URL stand for every route of that shape), and compares any `payTo`, network or price it restates with the live 402 |
+| **Well-known manifest** | fetches `/.well-known/x402` (the shapes deployed today: lists under `resources`, `items`, `endpoints`, `routes`, `services`, `tools` or `accepts` holding URLs, `METHOD /path` strings or objects; maps keyed by route; a whole OpenAPI document; a host-level `mcp` or `access` endpoint), checks the paid route or MCP tool is listed and, for MCP tools, whether the entry declares its transport (`:param` / `{param}` templates match, and an entry's `routeTemplate`, as in the Bazaar extension, lets a probeable example URL stand for every route of that shape), and compares any `payTo`, network or price it restates with the live 402 |
 | **Bazaar discovery** | `extensions.bazaar` present and validated with the official `@x402/extensions` validator; input shape, `routeTemplate` for path parameters, output example |
 | **OpenAPI** | finds `/openapi.json` or `/.well-known/openapi.json` and probes every listed operation: registries expect a 402 from each, so a free route listed there looks broken; `x-payment-info`, `x-guidance` |
 | **Bazaar index** | looks the resource up in the CDP Bazaar and shows when it was last updated and its 30-day calls and unique payers |
@@ -43,6 +47,8 @@ Method, limits and the script that reproduces these numbers: [`scan/`](scan/).
 ```
 --method <M>    HTTP method of the paid route (default GET)
 --body <json>   request body for POST routes that validate input before answering 402
+--mcp-tool <n>  the URL is an MCP endpoint: check this paid tool over the x402 MCP transport
+--mcp-args <j>  arguments for that tool call, as JSON (default {})
 --json          machine-readable output, for CI
 --no-openapi    skip the OpenAPI probe
 --no-bazaar     skip the CDP Bazaar lookup
@@ -100,12 +106,19 @@ Bazaar index
 
 That endpoint is [UnderIndex](https://github.com/ascanioUnderIndex/underindex-api), the x402 API this tool came out of: every check here is something we got wrong first.
 
+## Paid MCP tools
+
+x402 over MCP never sends a 402. An unpaid `tools/call` comes back as an ordinary HTTP 200 whose tool result carries the payment requirement, so a crawler that probes listed resources for a 402 marks a working MCP seller as broken. With `--mcp-tool` the checker speaks MCP instead: it sends `initialize`, lists the tools, calls the one you name without payment, and runs the same payment-option and metadata checks on the `PaymentRequired` it gets back.
+
+Tried on three live MCP sellers (2026-10-25): two returned spec-shaped challenges; the third described its price in prose and pointed to its HTTP API, which an MCP client cannot pay. In `/.well-known/x402` it reads the host-level forms they use (`"mcp": "https://host/mcp"`, `"mcp": { "endpoint", "transport", "tools" }`, `"access": { "type": "mcp", "url" }`) and a per-entry `transport`, the field proposed in the Domain Discovery WG ([issue #11](https://github.com/x402-foundation/wg-domain-discovery/issues/11)); the name may change with the spec.
+
 ## Use it from code
 
 ```js
 import { runChecks } from "x402-listing-check";
 
 const results = await runChecks("https://your-api.example.com/v1/paid-route", { method: "GET" });
+const mcp = await runChecks("https://your-api.example.com/mcp", { mcpTool: "your_tool", mcpArgs: {} });
 // [{ section, level: "pass" | "warn" | "fail" | "info", message, hint }]
 ```
 

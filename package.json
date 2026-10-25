@@ -1,7 +1,7 @@
 {
   "name": "x402-listing-check",
-  "version": "0.2.1",
-  "description": "Check an x402 endpoint the way the Bazaar, agentic.market, x402scan and x402-list see it, before you list it",
+  "version": "0.3.0",
+  "description": "Check an x402 endpoint or paid MCP tool the way the Bazaar, agentic.market, x402scan and x402-list see it, before you list it",
   "type": "module",
   "bin": {
     "x402-listing-check": "cli.mjs"
@@ -27,7 +27,8 @@
     "well-known",
     "payments",
     "agents",
-    "lint"
+    "lint",
+    "mcp"
   ],
   "repository": {
     "type": "git",
