@@ -497,12 +497,15 @@ export function manifestEntries(doc, origin) {
     }
   }
   // A host-level MCP endpoint: "mcp": "https://host/mcp", "mcp": { endpoint, transport, tools }, or
-  // "access": { type: "mcp", url }. Its tools are paid over the MCP transport, not with a 402.
+  // "access": { type: "mcp", url }. Its tools are paid over the MCP transport, not with a 402. Deployed
+  // objects also name the URL remoteConnector or streamable_http; the latter implies the transport.
   for (const key of ["mcp", "access"]) {
     const m = doc?.[key];
     if (typeof m === "string" && key === "mcp") add(m, undefined, { transport: "mcp", mcpEndpoint: true });
     else if (m && typeof m === "object" && !Array.isArray(m) && (key === "mcp" || /mcp/i.test(m.type ?? ""))) {
-      add(m.endpoint ?? m.url, undefined, { ...m, transport: m.transport ?? "mcp", mcpEndpoint: true });
+      const streamable = [m.streamable_http, m.streamableHttp].find((u) => typeof u === "string");
+      const url = [m.endpoint, m.url, m.remoteConnector, streamable].find((u) => typeof u === "string");
+      add(url, undefined, { ...m, transport: m.transport ?? (url === streamable ? "streamable-http" : "mcp"), mcpEndpoint: true });
     }
   }
   // An OpenAPI document served at the well-known path itself

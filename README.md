@@ -110,7 +110,7 @@ That endpoint is [UnderIndex](https://github.com/ascanioUnderIndex/underindex-ap
 
 x402 over MCP never sends a 402. An unpaid `tools/call` comes back as an ordinary HTTP 200 whose tool result carries the payment requirement, so a crawler that probes listed resources for a 402 marks a working MCP seller as broken. With `--mcp-tool` the checker speaks MCP instead: it sends `initialize`, lists the tools, calls the one you name without payment, and runs the same payment-option and metadata checks on the `PaymentRequired` it gets back.
 
-Tried on three live MCP sellers (2026-10-25): two returned spec-shaped challenges; the third described its price in prose and pointed to its HTTP API, which an MCP client cannot pay. In `/.well-known/x402` it reads the host-level forms they use (`"mcp": "https://host/mcp"`, `"mcp": { "endpoint", "transport", "tools" }`, `"access": { "type": "mcp", "url" }`) and a per-entry `transport`, the field proposed in the Domain Discovery WG ([issue #11](https://github.com/x402-foundation/wg-domain-discovery/issues/11)); the name may change with the spec.
+Tried on three live MCP sellers (2026-10-25): two returned spec-shaped challenges; the third described its price in prose and pointed to its HTTP API, which an MCP client cannot pay. In `/.well-known/x402` it reads the host-level forms they use (`"mcp": "https://host/mcp"`, `"mcp": { "endpoint", "transport", "tools" }`, with the URL also under `url`, `remoteConnector` or `streamable_http`, and `"access": { "type": "mcp", "url" }`) and a per-entry `transport`, the field proposed in the Domain Discovery WG ([issue #11](https://github.com/x402-foundation/wg-domain-discovery/issues/11)); the name may change with the spec.
 
 ## Use it from code
 

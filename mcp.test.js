@@ -110,6 +110,12 @@ test("reads a host-level mcp endpoint in the manifest and its tool list", async 
     assert.ok(out.includes("warn: the manifest's MCP tool list does not include analyse"));
     serve({ access: { type: "mcp", url: "https://api.example.org/mcp" } });
     assert.ok(msgs(await checkWellKnown(url, "POST", live, { mcpTool: "analyse" })).includes("pass: listed as the manifest's MCP endpoint"));
+    // Keys seen in deployed manifests (October 2026)
+    serve({ mcp: { remoteConnector: "https://api.example.org/mcp", remoteNote: "Streamable HTTP, no auth" } });
+    assert.ok(msgs(await checkWellKnown(url, "POST", live, { mcpTool: "analyse" })).includes("pass: listed as the manifest's MCP endpoint"));
+    serve({ mcp: { manifest: "https://api.example.org/.well-known/mcp", streamable_http: "https://api.example.org/mcp" } });
+    assert.ok(msgs(await checkWellKnown(url, "POST", live, { mcpTool: "analyse" }))
+      .includes('pass: listed as the manifest\'s MCP endpoint (transport "streamable-http")'));
   } finally {
     globalThis.fetch = realFetch;
   }
